@@ -1,2 +1,318 @@
-# bulkrnaseq_deseq2
-Generalized script for DESeq2 analysis of gene counts matrix from nf-core/rnaseq pipeline
+---
+title: "Generalized script for DESeq2 analysis of gene counts matrix from nf-core/rnaseq pipeline"
+subtitle: "Following instructions from official tutorial for DESeq2: [Analyzing RNA-seq data with DESeq2](https://bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html)"
+author: Katherine Beigel
+date: "`r Sys.Date()`"
+---
+
+```{r Setup, message=FALSE, results = 'hide'}
+
+# Utility
+library(tidyverse)
+library(readr)
+library(Matrix)
+
+# Analysis
+library(WGCNA)
+library(DESeq2)
+library(vsn)
+library(AnnotationDbi)
+
+# Plotting
+library(pheatmap)
+library(RColorBrewer)
+library(ggplot2)
+library(ggrepel)
+
+```
+
+
+# Project set up
+
+```{r Directory paths}
+
+version = "V1"
+
+proj_name = "My_Project"
+
+dir_proj = "/project/directory/"
+dir_results = "/project/directory/subdir_for_results/"
+
+infile_counts = "/path/to/input/counts_file.tsv" # path to the count matrix from nf-core/rnaseq
+infile_metadata = "/path/to/input/metada_file.tsv" # path to metadata file with information about the samples
+
+```
+
+
+# Load count matrix and metadata
+
+``` {r Load data}
+
+# RSEM count file from nf-core/rnaseq: genes (rows) x samples (col), counts rounded to integers
+countdata_raw = read_tsv(infile_counts)
+
+countdata = countdata_raw %>%
+  dplyr::select(-`transcript_id(s)`) %>% # drop column of transcript IDs
+  column_to_rownames('gene_id') %>% # make the gene_id col the rownames
+  round() # round the counts to integers
+
+```
+
+
+# Filter out any genes that have too low counts
+
+```{r Pre-filtering}
+
+# Filter samples and genes with too many missing entries (WGCNA)
+to_keep = goodSamplesGenes(t(countdata)) # transpose, need rows of samples x columns of genes
+countdata_filt = countdata[to_keep$goodGenes,]
+countdata_filt = countdata[,to_keep$goodSamples]
+
+# Filter cm for genes (rows) that have greater than 50 counts across all samples
+# 50 is arbitrary-ish, if this is too high/low, this can be changed
+countmat = countdata_filt[which(rowSums(countdata_filt) > 50), ]
+
+```
+
+
+# Save the filtered count matrix
+
+``` {r Write count CSV (not required)}
+
+write.csv(countmat,
+          file = paste0(dir_results, proj_name, "_", "FilteredCountMatrix", "_", version, ".csv"))
+
+```
+
+
+# Prepare metadata
+
+```{r Metadata prep}
+
+# Make metadata table or read in table of experiment design/metadata (tsv)
+# Col 1: sample IDs that match the Ids in the count matrix
+# Other columns: metadata categories and information
+
+# OPTION 1
+# Read in metadata file
+metadata_raw = read.table(infile_metadata, header = TRUE, sep = "\t")
+
+# OPTION 2:
+# Metadata table should look something like this:
+# metadata_raw = data.frame(sample	= c("sampleA", "sampleB", "sampleC", "sampleD"),
+#                          cell_type = c("celltype1", "celltype2", "celltype1", "celltype2"),
+#                          treatment = c("control", "treated", "treated", "control"))
+
+
+# Arrange rows in metadata so the sample order matches the countmat column order
+metadata = metadata_raw %>%
+  arrange(factor(sample, levels = colnames(countmat))) 
+
+# Integers, characters, etc need to be converted to factors in the metadata
+metadata[sapply(metadata, is.character)] = lapply(metadata[sapply(metadata, is.character)], as.factor)
+
+# Relevel the sample data
+# Here I have a column called "treatment" which specifies treated vs control samples
+# Setting the control as the reference level (so we can compare treatment to control)
+metadata$treatment = relevel(metadata$treatment,
+                              ref = "control")
+
+```
+
+
+# Prepare DESeq2 Analysis
+
+```{r DESeq2}
+
+# Following DESeq2 instructions
+# https://bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html
+
+# Specify the design formula
+# Set this to whatever condition you want to compare in the metadata, e.g. `~ treatment` or `cell_type + treatment`
+design_formula = ~ cell_type + treatment
+
+# Make DESeq data set from the filtered count matrix
+dds = DESeqDataSetFromMatrix(countData = countmat,
+                              colData = metadata,
+                              design = design_formula)
+
+# DESeq2 variance stabilizing transformation for plotting heatmaps
+vsd = vst(dds, blind = FALSE)
+ntd = normTransform(dds)
+# rld = rlog(dds, blind = FALSE) #rld() can be used if vst() doesn't look good
+
+# Plot to see how they look
+meanSdPlot(assay(vsd))
+meanSdPlot(assay(ntd))
+
+# Estimate size factors to account for sequencing depth
+dds = estimateSizeFactors(dds)
+
+# Run differential expression pipeline on the raw counts
+dds = DESeq(dds)
+
+# Produce results table by specifying the contrast of interest
+# Change the contrast to whatever you want to compare
+res = results(dds, contrast = c("treatment", "treated", "control"))  # e.g. contrast = c("condition","treated","untreated"))
+
+# Order based on adjusted pvalue (pdj)
+res_df =  as.data.frame(res) %>%
+  arrange(padj)
+
+```
+
+
+# Get symbols for the features
+
+```{r Get symbols for the features}
+
+# Get symbols instead of ENSEMBL IDs
+require(org.Mm.eg.db)
+
+id_conversions = (
+  AnnotationDbi::mapIds(
+    org.Mm.eg.db,
+    keys = rownames(res_df),
+    column = c('SYMBOL'),
+    keytype = 'ENSEMBL')
+  )
+
+for (row in 1:nrow(res_df)){
+  if (!is.na(id_conversions[row])){
+    res_df[row, 'symbol'] = as.vector(unlist(id_conversions[row], use.names = FALSE))
+  } else if (is.na(id_conversions[row])){
+    res_df[row, 'symbol'] = rownames(res_df)[row]
+  }
+}
+
+# write to file (.csv)
+write.csv(res_df,
+          file = paste0(dir_results, proj_name, "_", "DESeq2Results", "_", version, ".csv"))
+
+```
+
+
+# Heatmap plotting of samples
+
+## Heatmap plot sample distances function
+
+```{r Heatmap plot smaple distances function}
+
+plot_heatmap_sampledist = function(deseq_transform_obj, col_anno_1, col_anno_2){
+  
+  sampleDists <- dist(t(assay(deseq_transform_obj)))
+  
+  df = as.data.frame(colData(dds)[, c(col_anno_1, col_anno_2)])
+  
+  sampleDistMatrix <- as.matrix(sampleDists)
+  colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+  pheatmap(sampleDistMatrix,
+           clustering_distance_rows = sampleDists,
+           clustering_distance_cols = sampleDists,
+           col = colors,
+           annotation_col = df,
+           cellwidth = 50,
+           cellheight = 50)
+  
+}
+
+```
+
+
+## Heatmap plot sample distances 
+
+```{r Heatmap plot sample distances}
+
+plot_heatmap_sampledist(vsd, "treatment", "cell_type")
+
+```
+
+
+
+# PCA plotting of samples
+
+## PCA plot function
+
+```{r PCA function}
+
+# PCA plotting function
+plot_pca = function(deseq_transform_obj, variable_pca_color, variable_pca_shape){
+  
+  # Get PCA data
+  pcaData = plotPCA(deseq_transform_obj,
+                    intgroup = c(variable_pca_color, variable_pca_shape),
+                    returnData = TRUE)
+  
+  # Get percent variance
+  percentVar = round(100 * attr(pcaData, "percentVar"))
+  
+  # Plot PCA
+  ggplot(pcaData,
+         aes(x = PC1,
+             y = PC2,
+             color = !!sym(variable_pca_color),
+             shape = !!sym(variable_pca_shape),
+             label = rownames(pcaData))) +
+    geom_point(size = 3) +
+    geom_text_repel() +
+    xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+    ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+    theme(aspect.ratio = 1)
+  
+}
+
+```
+
+
+## PCA plot by treatment and cell_type
+
+``` {r PCA plot by treatment}
+
+plot_pca(vsd, "treatment", "cell_type")
+
+```
+
+
+# Heatmp plotting
+
+## Heatmp plot function
+
+```{r Heatmap of genes function}
+
+plot_heatmap_genevst = function(dds_obj, deseq_transform_obj, list_of_genes, col_anno_1, col_anno_2){
+  
+  genes_oi = res_df %>%
+    filter(symbol %in% list_of_genes | rownames(.) %in% list_of_genes)
+  
+  gene_sym_key = genes_oi %>%
+    dplyr::select(symbol)
+  
+  df = as.data.frame(colData(dds)[, c(col_anno_1, col_anno_2)])
+  
+  pheatmap(as.data.frame(assay(vsd)) %>%
+             filter(rownames(.) %in% rownames(gene_sym_key)) %>%
+             `rownames<-`(gene_sym_key$symbol),
+           cluster_rows = FALSE,
+           show_rownames = TRUE,
+           cluster_cols = TRUE,
+           annotation_col = df,
+           cellwidth = 25,
+           cellheight = 25)
+  
+}
+
+```
+
+
+## Heatmap of a list of genes of interest
+
+``` {r Heatmap plot of genes of interest}
+
+list_of_genes = c("Vipr1", "ENSMUSG00000011171", "Vipr2", "Foxp3", "Rorc") # put your gene symbols or ENSEMBL IDs here
+
+# This will plot the vsd values for the specified list of genes
+# If your gene does not appear on the heatmap, try using the ENSMUSG ID
+# If neither symbol nor ENSMUSG ID work, the gene is not in the results
+plot_heatmap_genevst(dds, vsd, list_of_genes, "treatment", "cell_type") 
+
+```
