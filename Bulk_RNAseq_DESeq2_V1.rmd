@@ -39,7 +39,7 @@ dir_proj = "/project/directory/"
 dir_results = "/project/directory/subdir_for_results/"
 
 infile_counts = "/path/to/input/counts_file.tsv" # path to the count matrix from nf-core/rnaseq
-infile_metadata = "/path/to/input/metada_file.tsv" # path to metadata file with information about the samples
+infile_metadata = "/path/to/input/metadata_file.tsv" # path to metadata file with information about the samples
 
 ```
 
@@ -65,8 +65,12 @@ countdata = countdata_raw %>%
 
 # Filter samples and genes with too many missing entries (WGCNA)
 to_keep = goodSamplesGenes(t(countdata)) # transpose, need rows of samples x columns of genes
+# If any samples need to be removed (probably not):
+# countdata_filt = countdata[,to_keep$goodSamples]
+
+# To remove genes with too many missing entries
 countdata_filt = countdata[to_keep$goodGenes,]
-countdata_filt = countdata[,to_keep$goodSamples]
+
 
 # Filter cm for genes (rows) that have greater than 50 counts across all samples
 # 50 is arbitrary-ish, if this is too high/low, this can be changed
